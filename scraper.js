@@ -17,7 +17,7 @@ async function scrapeInstagram(username) {
   });
   const page = await browser.newPage();
 
-  // Set a realistic User-Agent to avoid immediate blocking
+  // Set a realistic User-Agent
   await page.setUserAgent(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
   );
@@ -25,17 +25,15 @@ async function scrapeInstagram(username) {
 
   const networkLogs = [];
 
-  // Enable request interception to capture API responses
+  // Enable request interception
   page.on("response", async (response) => {
     const request = response.request();
-    // We care about XHR/Fetch for data
     if (
       request.resourceType() === "xhr" ||
       request.resourceType() === "fetch"
     ) {
       try {
         const url = response.url();
-        // Filter for GraphQL or internal API endpoints
         if (url.includes("graphql") || url.includes("/api/v1/")) {
           const contentType = response.headers()["content-type"];
           if (contentType && contentType.includes("application/json")) {
@@ -46,7 +44,7 @@ async function scrapeInstagram(username) {
           }
         }
       } catch (err) {
-        // ignore errors reading response body (e.g. redirects)
+        // ignore errors
       }
     }
   });
@@ -57,26 +55,13 @@ async function scrapeInstagram(username) {
 
     await page.goto(url, { waitUntil: "networkidle2", timeout: 60000 });
 
-    // Wait a bit for any lazy requests and scroll down a bit to trigger more loading
+    // Scroll to trigger loading
     await page.evaluate(() => window.scrollBy(0, 500));
     await new Promise((r) => setTimeout(r, 5000));
 
-    // Save network logs for debugging
-    fs.writeFileSync(
-      "debug_network.json",
-      JSON.stringify(networkLogs, null, 2)
-    );
-    console.log(`Captured ${networkLogs.length} network responses.`);
-
-    // DEBUG: Save HTML to see what we got
-    const content = await page.content();
-    fs.writeFileSync("debug.html", content);
-    // await page.screenshot({ path: "debug_view.png", fullPage: true });
-
-    // --- DATA EXTRACTION FROM NETWORK LOGS ---
+    // --- NETWORK EXTRACTION ---
     let posts = [];
 
-    // Helper to find key in deep object
     function findEdges(obj) {
       if (!obj || typeof obj !== "object") return [];
       if (
@@ -102,7 +87,6 @@ async function scrapeInstagram(username) {
         edges.forEach((edge) => {
           const node = edge.node;
           if (node) {
-            // Extract basic info
             const post = {
               id: node.id,
               shortcode: node.shortcode,
@@ -113,57 +97,40 @@ async function scrapeInstagram(username) {
                 node.edge_media_to_caption.edges.length > 0
                   ? node.edge_media_to_caption.edges[0].node.text
                   : "",
-              commentsCount: node.edge_media_to_comment
-                ? node.edge_media_to_comment.count
-                : 0,
-              likesCount: node.edge_media_preview_like
-                ? node.edge_media_preview_like.count
-                : 0,
+              commentsCount: node.edge_media_to_comment?.count || 0,
+              likesCount: node.edge_media_preview_like?.count || 0,
               timestamp: node.taken_at_timestamp,
               ownerId: node.owner ? node.owner.id : null,
+              isVideo: node.is_video,
+              displayUrl: node.display_url,
             };
 
-            // Media Extraction Logic
             if (node.is_video && node.video_url) {
-              post.isVideo = true;
               post.videoUrl = node.video_url;
               post.videoViewCount = node.video_view_count;
-              post.displayUrl = node.display_url; // Thumbnail
-            } else {
-              post.isVideo = false;
-              post.displayUrl = node.display_url;
             }
 
-            // Sidecar (Carousel) Handling
             if (
               node.edge_sidecar_to_children &&
               node.edge_sidecar_to_children.edges
             ) {
               post.isSidecar = true;
               post.children = node.edge_sidecar_to_children.edges.map(
-                (childEdge) => {
-                  const child = childEdge.node;
-                  return {
-                    id: child.id,
-                    type: child.__typename,
-                    isVideo: child.is_video,
-                    displayUrl: child.display_url,
-                    videoUrl: child.is_video ? child.video_url : null,
-                    accessibilityCaption: child.accessibility_caption,
-                  };
-                }
+                (childEdge) => ({
+                  id: childEdge.node.id,
+                  displayUrl: childEdge.node.display_url,
+                  isVideo: childEdge.node.is_video,
+                  videoUrl: childEdge.node.video_url,
+                })
               );
-              // Collect all image URLs for convenience
               post.images = post.children.map((c) => c.displayUrl);
             }
-
             posts.push(post);
           }
         });
       }
     }
 
-    // Deduplicate posts
     posts = posts.filter(
       (v, i, a) => a.findIndex((v2) => v2.shortcode === v.shortcode) === i
     );
@@ -174,33 +141,49 @@ async function scrapeInstagram(username) {
     }
 
     // --- DOM FALLBACK ---
-    console.log("Network extraction failed/empty. Trying DOM fallback...");
+    console.log("Network extraction failed. Trying DOM fallback...");
     await page
       .waitForSelector("article img", { timeout: 5000 })
-      .catch(() => console.log("No posts found or timeout wait for images"));
+      .catch(() => console.log("No posts found or timeout waiting for images"));
 
     const domPosts = await page.evaluate(() => {
-      const postElements = document.querySelectorAll("article a"); // Links to posts
+      const postElements = document.querySelectorAll("article a");
       const data = [];
-
       postElements.forEach((post) => {
         const link = post.href;
         const img = post.querySelector("img");
-        const src = img ? img.src : null;
-        const alt = img ? img.alt : null;
-
-        if (link && src) {
+        if (link && img) {
           data.push({
             link,
-            imageUrl: src,
-            caption: alt,
+            imageUrl: img.src,
+            caption: img.alt,
           });
         }
       });
       return data;
     });
 
-    return domPosts;
+    if (domPosts.length > 0) {
+      return domPosts;
+    }
+
+    // --- DEBUG: IF STILL EMPTY, CHECK FOR LOGIN WALL ---
+    const pageTitle = await page.title();
+    const content = await page.content();
+    const isLogin =
+      content.includes("Login") ||
+      content.includes("Log In") ||
+      pageTitle.includes("Login");
+
+    console.log(`DEBUG: Title: ${pageTitle}, Is Login? ${isLogin}`);
+
+    // Return specific object to alert the Server
+    return {
+      _debug_error: true,
+      message: "No posts found. Likely blocked by Login Wall.",
+      pageTitle: pageTitle,
+      isLogin: isLogin,
+    };
   } catch (error) {
     console.error(`Error scraping ${username}: ${error.message}`);
     throw new Error(`Failed to scrape ${username}: ${error.message}`);
