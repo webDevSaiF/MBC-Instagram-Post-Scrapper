@@ -1,0 +1,8 @@
+node_modules
+npm-debug.log
+debug_network.json
+debug.html
+*.png
+.git
+.gitignore
+Dockerfile
