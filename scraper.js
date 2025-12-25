@@ -13,11 +13,30 @@ async function scrapeInstagram(username) {
       "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
       "--disable-gpu",
+      "--window-size=1280,800",
     ],
   });
   const page = await browser.newPage();
 
-  // Set a realistic User-Agent
+  // 1. SET THE COOKIE (The Key Fix)
+  // This injects your login session so Instagram thinks you are a real user.
+  if (process.env.INSTAGRAM_SESSION_ID) {
+    await page.setCookie({
+      name: "sessionid",
+      value: process.env.INSTAGRAM_SESSION_ID,
+      domain: ".instagram.com",
+      path: "/",
+      httpOnly: true,
+      secure: true,
+    });
+    console.log("✅ Session ID cookie set.");
+  } else {
+    console.warn(
+      "⚠️ No INSTAGRAM_SESSION_ID found. Scraping might be blocked."
+    );
+  }
+
+  // Set User-Agent
   await page.setUserAgent(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
   );
@@ -25,7 +44,6 @@ async function scrapeInstagram(username) {
 
   const networkLogs = [];
 
-  // Enable request interception
   page.on("response", async (response) => {
     const request = response.request();
     if (
@@ -38,14 +56,10 @@ async function scrapeInstagram(username) {
           const contentType = response.headers()["content-type"];
           if (contentType && contentType.includes("application/json")) {
             const json = await response.json().catch(() => null);
-            if (json) {
-              networkLogs.push({ url, data: json });
-            }
+            if (json) networkLogs.push({ url, data: json });
           }
         }
-      } catch (err) {
-        // ignore errors
-      }
+      } catch (err) {}
     }
   });
 
@@ -55,7 +69,7 @@ async function scrapeInstagram(username) {
 
     await page.goto(url, { waitUntil: "networkidle2", timeout: 60000 });
 
-    // Scroll to trigger loading
+    // Scroll
     await page.evaluate(() => window.scrollBy(0, 500));
     await new Promise((r) => setTimeout(r, 5000));
 
@@ -141,10 +155,10 @@ async function scrapeInstagram(username) {
     }
 
     // --- DOM FALLBACK ---
-    console.log("Network extraction failed. Trying DOM fallback...");
+    console.log("Network empty. Trying DOM fallback...");
     await page
       .waitForSelector("article img", { timeout: 5000 })
-      .catch(() => console.log("No posts found or timeout waiting for images"));
+      .catch(() => console.log("Timeout waiting for images"));
 
     const domPosts = await page.evaluate(() => {
       const postElements = document.querySelectorAll("article a");
@@ -167,20 +181,14 @@ async function scrapeInstagram(username) {
       return domPosts;
     }
 
-    // --- DEBUG: IF STILL EMPTY, CHECK FOR LOGIN WALL ---
+    // --- DEBUG RETURN ---
     const pageTitle = await page.title();
     const content = await page.content();
-    const isLogin =
-      content.includes("Login") ||
-      content.includes("Log In") ||
-      pageTitle.includes("Login");
+    const isLogin = content.includes("Login") || content.includes("Log In");
 
-    console.log(`DEBUG: Title: ${pageTitle}, Is Login? ${isLogin}`);
-
-    // Return specific object to alert the Server
     return {
       _debug_error: true,
-      message: "No posts found. Likely blocked by Login Wall.",
+      message: "Scraping Blocked. Did you set INSTAGRAM_SESSION_ID correctly?",
       pageTitle: pageTitle,
       isLogin: isLogin,
     };
