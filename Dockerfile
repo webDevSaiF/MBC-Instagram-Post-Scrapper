@@ -1,55 +1,24 @@
-FROM node:18-slim
+# Use the official Puppeteer image which includes a working Chrome
+FROM ghcr.io/puppeteer/puppeteer:24.0.0
 
-# ─────────────────────────────────────
-# Install system dependencies required by Chromium
-# ─────────────────────────────────────
-RUN apt-get update && apt-get install -y \
-  ca-certificates \
-  fonts-liberation \
-  libasound2 \
-  libatk-bridge2.0-0 \
-  libatk1.0-0 \
-  libcups2 \
-  libdbus-1-3 \
-  libdrm2 \
-  libgbm1 \
-  libgtk-3-0 \
-  libnspr4 \
-  libnss3 \
-  libx11-xcb1 \
-  libxcomposite1 \
-  libxdamage1 \
-  libxrandr2 \
-  libxss1 \
-  libxtst6 \
-  wget \
-  --no-install-recommends \
-  && rm -rf /var/lib/apt/lists/*
+# 1. Skip downloading Chrome again (we use the pre-installed one)
+# 2. Point Puppeteer to the correct system Chrome path
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable
 
-# ─────────────────────────────────────
-# App directory
-# ─────────────────────────────────────
 WORKDIR /usr/src/app
 
-# Copy package files first (better cache)
-COPY package*.json ./
+# Copy package files with correct permission for the 'pptruser'
+COPY --chown=pptruser:pptruser package*.json ./
 
-# Install dependencies (runs postinstall -> installs Chrome)
-RUN npm ci --omit=dev
+# Install dependencies (ignoring the postinstall script to prevent duplicate downloads)
+RUN npm install --ignore-scripts
 
-# Copy app source
-COPY . .
+# Copy the rest of your app source code
+COPY --chown=pptruser:pptruser . .
 
-# ─────────────────────────────────────
-# Non-root user (important for security)
-# ─────────────────────────────────────
-RUN groupadd -r pptruser && useradd -r -g pptruser -G audio,video pptruser \
-  && mkdir -p /home/pptruser/Downloads \
-  && chown -R pptruser:pptruser /home/pptruser \
-  && chown -R pptruser:pptruser /usr/src/app
-
-USER pptruser
-
+# Expose the port
 EXPOSE 3000
 
+# Start the server
 CMD ["node", "server.js"]
