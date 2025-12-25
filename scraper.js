@@ -4,14 +4,10 @@ puppeteer.use(StealthPlugin());
 const fs = require("fs");
 
 async function scrapeInstagram(username) {
-  const dockerChromePath = "/usr/bin/google-chrome-stable";
-  const executablePath = fs.existsSync(dockerChromePath)
-    ? dockerChromePath
-    : puppeteer.executablePath();
-
   const browser = await puppeteer.launch({
     headless: true,
-    executablePath: executablePath,
+    executablePath:
+      process.env.PUPPETEER_EXECUTABLE_PATH || puppeteer.executablePath(),
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
