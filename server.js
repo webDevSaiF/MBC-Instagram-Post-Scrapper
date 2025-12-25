@@ -1,86 +1,118 @@
+"use strict";
+
 const express = require("express");
+const puppeteer = require("puppeteer-extra");
+const StealthPlugin = require("puppeteer-extra-plugin-stealth");
 const { scrapeInstagram } = require("./scraper");
+require("dotenv").config();
+
+// ─────────────────────────────────────
+// Puppeteer setup
+// ─────────────────────────────────────
+puppeteer.use(StealthPlugin());
+
+// Node < 18 safety (Render uses Node 18+, but safe anyway)
+if (!global.fetch) {
+  global.fetch = (...args) =>
+    import("node-fetch").then(({ default: fetch }) => fetch(...args));
+}
+
+// ─────────────────────────────────────
+// App setup
+// ─────────────────────────────────────
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+app.use(express.json());
+
+// ─────────────────────────────────────
+// Token cache
+// ─────────────────────────────────────
 let cachedToken = null;
 let cachedTokenFetchedAt = 0;
 const TOKEN_CACHE_MS = 60 * 1000;
-app.use(express.json());
 
+// ─────────────────────────────────────
+// Health check (RENDER REQUIRED)
+// ─────────────────────────────────────
+app.get("/", (req, res) => {
+  res.json({ success: true, status: "Server is running" });
+});
+
+// ─────────────────────────────────────
+// Scrape API
+// ─────────────────────────────────────
 app.get("/api/scrape/:username", async (req, res) => {
   try {
+    // ─── Authorization ───
     const authHeader =
       req.headers["authorization"] || req.headers["Authorization"];
+
     if (!authHeader) {
       return res
         .status(401)
-        .set(
-          "WWW-Authenticate",
-          'Bearer realm="Access to the resource", error="invalid_token"'
-        )
-        .json({ error: "unauthorized", message: "Access Token Missing" });
-    }
-    const token = extractBearer(authHeader);
-    console.log(token);
-    if (!token) {
-      return res
-        .status(401)
-        .set(
-          "WWW-Authenticate",
-          'Bearer realm="Access to the resource", error="invalid_token"'
-        )
+        .set("WWW-Authenticate", 'Bearer realm="Access", error="invalid_token"')
         .json({
           error: "unauthorized",
-          message:
-            "Invalid Authorization header. Use: Authorization: Bearer <token>",
+          message: "Access Token Missing",
         });
     }
+
+    const token = extractBearer(authHeader);
+    if (!token) {
+      return res.status(401).json({
+        error: "unauthorized",
+        message: "Use Authorization: Bearer <token>",
+      });
+    }
+
     const allowedToken = await validateToken();
     if (!allowedToken || token !== allowedToken) {
-      return res
-        .status(401)
-        .set(
-          "WWW-Authenticate",
-          'Bearer realm="Access to the resource", error="invalid_token"'
-        )
-        .json({
-          error: "unauthorized",
-          message: "Invalid or missing authorization token.",
-        });
+      return res.status(401).json({
+        error: "unauthorized",
+        message: "Invalid authorization token",
+      });
     }
-  } catch (authErr) {
-    console.error("Auth error:", authErr);
+
+    // ─── Username ───
+    const { username } = req.params;
+    if (!username) {
+      return res.status(400).json({ error: "Username is required" });
+    }
+
+    console.log(`🚀 Starting scrape for: ${username}`);
+
+    const data = await scrapeInstagram(username);
+
+    return res.json({
+      success: true,
+      count: data.length,
+      data,
+    });
+  } catch (error) {
+    console.error("❌ Scraping failed:", error);
     return res.status(500).json({
-      error: "auth_error",
-      message: "Error while validating authorization token.",
+      success: false,
+      error: error.message || "Scraping failed",
     });
   }
-  const { username } = req.params;
-  if (!username) {
-    return res.status(400).json({ error: "Username is required" });
-  }
-
-  try {
-    console.log(`Starting scrape for user: ${username}`);
-    const data = await scrapeInstagram(username);
-    res.json({ success: true, count: data.length, data });
-  } catch (error) {
-    console.error("Scraping failed:", error);
-    res.status(500).json({ success: false, error: error.message });
-  }
 });
-// ---------- AUTH HELPERS ----------
 
+// ─────────────────────────────────────
+// Auth helpers
+// ─────────────────────────────────────
 function extractBearer(headerValue) {
-  const token = headerValue
-    .replace(/bearer/gi, "")
-    .replace(/[\s:]+/g, " ")
-    .trim();
-  return token || null;
+  return (
+    headerValue
+      .replace(/bearer/gi, "")
+      .replace(/[\s:]+/g, " ")
+      .trim() || null
+  );
 }
 
 async function validateToken() {
   const now = Date.now();
+
   if (
     cachedToken &&
     cachedTokenFetchedAt &&
@@ -90,36 +122,38 @@ async function validateToken() {
   }
 
   const url = process.env.MBC_SHEET_DATABASE;
-  console.log(url);
   if (!url) {
-    console.error("MBC_SHEET_DATABASE env var is not set");
+    console.error("❌ MBC_SHEET_DATABASE env var not set");
     return null;
   }
 
-  const requestOptions = {
-    method: "GET",
-    redirect: "follow",
-  };
-
   try {
-    const response = await fetch(url, requestOptions);
+    const response = await fetch(url);
     if (!response.ok) {
-      console.error("Token DB request failed with status:", response.status);
+      console.error("❌ Token DB status:", response.status);
       return null;
     }
 
     const result = await response.json();
-    // Adjust this path if your sheet JSON shape is different
-    const data = result.data["Bot Database"][0]["access_token"];
+    const token = result?.data?.["Bot Database"]?.[0]?.["access_token"] || null;
 
-    cachedToken = data;
+    if (!token) {
+      console.error("❌ Token not found in sheet");
+      return null;
+    }
+
+    cachedToken = token;
     cachedTokenFetchedAt = now;
-
-    return data;
-  } catch (error) {
-    console.error("Error fetching token DB:", error);
+    return token;
+  } catch (err) {
+    console.error("❌ Token fetch error:", err);
     return null;
   }
 }
 
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// ─────────────────────────────────────
+// Start server
+// ─────────────────────────────────────
+app.listen(PORT, () => {
+  console.log(`✅ Server running on port ${PORT}`);
+});
