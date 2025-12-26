@@ -25,7 +25,6 @@ async function scrapeInstagram(username) {
 
   // --- 1. SET SESSION COOKIE IF PROVIDED ---
   if (process.env.INSTAGRAM_SESSION_ID) {
-    // console.log("Applying Session ID...");
     await page.setCookie({
       name: "sessionid",
       value: process.env.INSTAGRAM_SESSION_ID,
@@ -85,6 +84,7 @@ async function scrapeInstagram(username) {
       return [];
     }
 
+    // Search Network Logs
     for (const log of networkLogs) {
       const jsonString = JSON.stringify(log.data);
       if (jsonString.includes('edge_owner_to_timeline_media')) {
@@ -142,12 +142,34 @@ async function scrapeInstagram(username) {
       return posts;
     }
 
-    // --- DIAGNOSTICS ---
-    console.log('Network extraction failed/empty. Checking why...');
-    const title = await page.title();
+    // --- DOM FALLBACK WITH EXPANDED SELECTORS ---
+    console.log('Trying DOM fallback...');
+    const domPosts = await page.evaluate(() => {
+      // Updated selectors to catch more variations of the grid
+      const postElements = document.querySelectorAll('article a, div._aagv');
+      const data = [];
+      postElements.forEach(post => {
+        const link = post.href || post.closest('a')?.href;
+        const img = post.querySelector('img') || post.closest('img');
 
-    // Detailed Debug Info specifically for User/Render debugging
-    // This will only be returned if posts.length == 0
+        if (link && img && link.includes('/p/')) {
+          data.push({
+            link,
+            imageUrl: img.src,
+            caption: img.alt || ''
+          });
+        }
+      });
+      return data;
+    });
+
+    if (domPosts.length > 0) return domPosts;
+
+    // --- DIAGNOSTICS (HTML DUMP) ---
+    console.log('Scrape failed. Dumping diagnostics...');
+    const title = await page.title();
+    const htmlSnippet = await page.content();
+
     return {
       _debug_error: true,
       message: "NO_POSTS_FOUND",
@@ -159,7 +181,8 @@ async function scrapeInstagram(username) {
       debug_info: {
         page_title: title,
         network_requests: networkLogs.length,
-        cookies_set: !!process.env.INSTAGRAM_SESSION_ID
+        cookies_set: !!process.env.INSTAGRAM_SESSION_ID,
+        html_preview: htmlSnippet.substring(0, 2000) // DUMP HTML TO SEE WHAT RENDER SEES
       }
     };
 
