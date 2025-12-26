@@ -1,66 +1,46 @@
-const puppeteer = require("puppeteer-extra");
-const StealthPlugin = require("puppeteer-extra-plugin-stealth");
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 puppeteer.use(StealthPlugin());
-const fs = require("fs");
+const fs = require('fs');
 
 async function scrapeInstagram(username) {
   const browser = await puppeteer.launch({
-    headless: true,
-    executablePath:
-      process.env.PUPPETEER_EXECUTABLE_PATH || puppeteer.executablePath(),
+    headless: "new",
     args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--window-size=1280,800",
-    ],
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu'
+    ]
   });
   const page = await browser.newPage();
 
-  // 1. SET THE COOKIE
-  if (process.env.INSTAGRAM_SESSION_ID) {
-    await page.setCookie({
-      name: "sessionid",
-      value: process.env.INSTAGRAM_SESSION_ID,
-      domain: ".instagram.com",
-      path: "/",
-      httpOnly: true,
-      secure: true,
-    });
-    console.log("✅ Session ID cookie set.");
-  } else {
-    console.warn(
-      "⚠️ No INSTAGRAM_SESSION_ID found. Scraping might be blocked."
-    );
-  }
-
-  await page.setUserAgent(
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-  );
+  // Set a realistic User-Agent to avoid immediate blocking
+  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
   await page.setViewport({ width: 1280, height: 800 });
 
   const networkLogs = [];
 
-  // Capture Responses
-  page.on("response", async (response) => {
+  // Enable request interception to capture API responses
+  page.on('response', async (response) => {
     const request = response.request();
-    if (["xhr", "fetch"].includes(request.resourceType())) {
+    // We care about XHR/Fetch for data
+    if (request.resourceType() === 'xhr' || request.resourceType() === 'fetch') {
       try {
         const url = response.url();
-        // Capture everything that looks like data
-        if (
-          url.includes("graphql") ||
-          url.includes("/api/v1/") ||
-          url.includes("web_profile_info")
-        ) {
-          const contentType = response.headers()["content-type"];
-          if (contentType && contentType.includes("application/json")) {
+        // Filter for GraphQL or internal API endpoints
+        if (url.includes('graphql') || url.includes('/api/v1/')) {
+          const contentType = response.headers()['content-type'];
+          if (contentType && contentType.includes('application/json')) {
             const json = await response.json().catch(() => null);
-            if (json) networkLogs.push({ url, data: json });
+            if (json) {
+              networkLogs.push({ url, data: json });
+            }
           }
         }
-      } catch (err) {}
+      } catch (err) {
+        // ignore errors reading response body (e.g. redirects)
+      }
     }
   });
 
@@ -68,144 +48,129 @@ async function scrapeInstagram(username) {
     const url = `https://www.instagram.com/${username}/`;
     console.log(`Navigating to ${url}...`);
 
-    await page.goto(url, { waitUntil: "networkidle2", timeout: 60000 });
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
 
-    // Scroll heavily to trigger the main feed
-    await page.evaluate(async () => {
-      window.scrollBy(0, 1000);
-      await new Promise((r) => setTimeout(r, 1000));
-      window.scrollBy(0, 2000);
-    });
-    await new Promise((r) => setTimeout(r, 3000));
+    // Wait a bit for any lazy requests and scroll down a bit to trigger more loading
+    await page.evaluate(() => window.scrollBy(0, 500));
+    await new Promise(r => setTimeout(r, 5000));
 
-    // --- SMART EXTRACTION ---
+    // Create debug file if needed locally, but comment out for prod to save space
+    // fs.writeFileSync('debug_network.json', JSON.stringify(networkLogs, null, 2));
+
+    // Check if login is required or page not found
+    const privateAccount = await page.$('h2');
+
+    // --- DATA EXTRACTION FROM NETWORK LOGS ---
     let posts = [];
 
-    // Helper: Safely extract post details regardless of structure version
-    function parseNode(node) {
-      // Ignore Highlights or undefined nodes
-      if (!node || (node.id && node.id.includes("highlight"))) return null;
-
-      // Handle "shortcode" vs "code" (API variance)
-      const code = node.shortcode || node.code;
-      if (!code) return null; // If no code, it's not a valid post link
-
-      const post = {
-        id: node.id,
-        shortcode: code,
-        link: `https://www.instagram.com/p/${code}/`,
-        type: node.__typename || "Post",
-        timestamp: node.taken_at_timestamp || node.taken_at,
-        ownerId: node.owner ? node.owner.id : null,
-        likesCount: 0,
-        commentsCount: 0,
-        caption: "",
-      };
-
-      // Likes
-      if (node.edge_media_preview_like)
-        post.likesCount = node.edge_media_preview_like.count;
-      else if (node.like_count) post.likesCount = node.like_count;
-
-      // Comments
-      if (node.edge_media_to_comment)
-        post.commentsCount = node.edge_media_to_comment.count;
-      else if (node.comment_count) post.commentsCount = node.comment_count;
-
-      // Caption
-      if (node.edge_media_to_caption && node.edge_media_to_caption.edges?.[0]) {
-        post.caption = node.edge_media_to_caption.edges[0].node.text;
-      } else if (node.caption && node.caption.text) {
-        post.caption = node.caption.text;
+    // Helper to find key in deep object
+    function findEdges(obj) {
+      if (!obj || typeof obj !== 'object') return [];
+      if (obj.edges && Array.isArray(obj.edges) && obj.edges.length > 0 && obj.edges[0].node) {
+        return obj.edges;
       }
-
-      // Media
-      post.isVideo = !!node.is_video;
-      post.displayUrl =
-        node.display_url || node.image_versions2?.candidates?.[0]?.url;
-
-      return post;
+      for (const key in obj) {
+        if (obj.hasOwnProperty(key)) {
+          const res = findEdges(obj[key]);
+          if (res.length > 0) return res;
+        }
+      }
+      return [];
     }
 
-    // Look through all network logs
+    // Look for "edge_owner_to_timeline_media" in any captured JSON
     for (const log of networkLogs) {
-      const data = log.data;
+      const jsonString = JSON.stringify(log.data);
+      if (jsonString.includes('edge_owner_to_timeline_media')) {
+        const edges = findEdges(log.data);
+        if (edges.length > 0) {
+          edges.forEach(edge => {
+            const node = edge.node;
+            if (node) {
+              // Extract basic info
+              const post = {
+                id: node.id,
+                shortcode: node.shortcode,
+                link: `https://www.instagram.com/p/${node.shortcode}/`,
+                type: node.__typename,
+                caption: node.edge_media_to_caption && node.edge_media_to_caption.edges.length > 0 ? node.edge_media_to_caption.edges[0].node.text : '',
+                commentsCount: node.edge_media_to_comment ? node.edge_media_to_comment.count : 0,
+                likesCount: node.edge_media_preview_like ? node.edge_media_preview_like.count : 0,
+                timestamp: node.taken_at_timestamp,
+                ownerId: node.owner ? node.owner.id : null
+              };
 
-      // Strategy 1: GraphQL "edges" (Standard Web)
-      // We look specifically for 'edge_owner_to_timeline_media' to avoid Highlights
-      function findTimeline(obj) {
-        if (!obj || typeof obj !== "object") return;
-        if (
-          obj.edge_owner_to_timeline_media &&
-          obj.edge_owner_to_timeline_media.edges
-        ) {
-          obj.edge_owner_to_timeline_media.edges.forEach((edge) => {
-            const parsed = parseNode(edge.node);
-            if (parsed) posts.push(parsed);
+              // Media Extraction Logic
+              if (node.is_video && node.video_url) {
+                post.isVideo = true;
+                post.videoUrl = node.video_url;
+                post.videoViewCount = node.video_view_count;
+                post.displayUrl = node.display_url; // Thumbnail
+              } else {
+                post.isVideo = false;
+                post.displayUrl = node.display_url;
+              }
+
+              // Sidecar (Carousel) Handling
+              if (node.edge_sidecar_to_children && node.edge_sidecar_to_children.edges) {
+                post.isSidecar = true;
+                post.children = node.edge_sidecar_to_children.edges.map(childEdge => {
+                  const child = childEdge.node;
+                  return {
+                    id: child.id,
+                    type: child.__typename,
+                    isVideo: child.is_video,
+                    displayUrl: child.display_url,
+                    videoUrl: child.is_video ? child.video_url : null,
+                    accessibilityCaption: child.accessibility_caption
+                  };
+                });
+                // Collect all image URLs for convenience
+                post.images = post.children.map(c => c.displayUrl);
+              }
+
+              posts.push(post);
+            }
           });
         }
-        // Recursive search
-        Object.values(obj).forEach((val) => findTimeline(val));
-      }
-      findTimeline(data);
-
-      // Strategy 2: API v1 "items" (Mobile/Internal API)
-      if (data.items && Array.isArray(data.items)) {
-        data.items.forEach((item) => {
-          const parsed = parseNode(item);
-          if (parsed) posts.push(parsed);
-        });
       }
     }
 
     // Deduplicate posts
-    posts = posts.filter(
-      (v, i, a) => a.findIndex((v2) => v2.shortcode === v.shortcode) === i
-    );
+    posts = posts.filter((v, i, a) => a.findIndex(v2 => (v2.shortcode === v.shortcode)) === i);
 
     if (posts.length > 0) {
       console.log(`Extracted ${posts.length} posts from network logs.`);
       return posts;
     }
 
-    // --- DOM FALLBACK (Last Resort) ---
-    console.log("Network empty. Trying DOM fallback...");
-
-    // Wait specifically for square images inside articles (typical post grid)
-    await page
-      .waitForSelector("article a[href^='/p/']", { timeout: 5000 })
-      .catch(() => {});
+    // --- DOM FALLBACK ---
+    console.log('Network extraction failed/empty. Trying DOM fallback...');
+    await page.waitForSelector('article img', { timeout: 5000 }).catch(() => console.log('No posts found or timeout wait for images'));
 
     const domPosts = await page.evaluate(() => {
-      const postElements = document.querySelectorAll("article a[href^='/p/']");
+      const postElements = document.querySelectorAll('article a'); // Links to posts
       const data = [];
-      postElements.forEach((post) => {
-        const link = post.getAttribute("href"); // e.g., "/p/Cxy123/"
-        const img = post.querySelector("img");
 
-        if (link && img) {
-          const shortcode = link.split("/")[2];
+      postElements.forEach(post => {
+        const link = post.href;
+        const img = post.querySelector('img');
+        const src = img ? img.src : null;
+        const alt = img ? img.alt : null;
+
+        if (link && src) {
           data.push({
-            id: shortcode, // temporary ID
-            shortcode: shortcode,
-            link: `https://www.instagram.com${link}`,
-            imageUrl: img.src,
-            caption: img.alt || "",
-            type: "DOM_Fallback",
+            link,
+            imageUrl: src,
+            caption: alt
           });
         }
       });
       return data;
     });
 
-    if (domPosts.length > 0) return domPosts;
+    return domPosts;
 
-    return {
-      _debug_error: true,
-      message: "No posts found. Session might be invalid or profile empty.",
-      pageTitle: await page.title(),
-      isLogin: (await page.content()).includes("Login"),
-    };
   } catch (error) {
     console.error(`Error scraping ${username}: ${error.message}`);
     throw new Error(`Failed to scrape ${username}: ${error.message}`);

@@ -6,35 +6,23 @@ require("dotenv").config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const API_KEY = process.env.API_KEY; // Simple env var for security
 
 app.use(express.json());
 
-// Token cache
-let cachedToken = null;
-let cachedTokenFetchedAt = 0;
-const TOKEN_CACHE_MS = 60 * 1000;
-
 app.get("/", (req, res) => {
-  res.json({ success: true, status: "Server is running" });
+  res.json({ success: true, status: "Instagram Scraper API is running" });
 });
 
 app.get("/api/scrape/:username", async (req, res) => {
   try {
-    const authHeader = req.headers["authorization"];
-
-    if (!authHeader) {
-      return res.status(401).json({ error: "Access Token Missing" });
-    }
-
-    const token = extractBearer(authHeader);
-    if (!token) {
-      return res.status(401).json({ error: "Invalid Token Format" });
-    }
-
-    // Disable token check for local testing if needed, currently enabled
-    const allowedToken = await validateToken();
-    if (!allowedToken || token !== allowedToken) {
-      return res.status(401).json({ error: "Invalid Authorization Token" });
+    // Simple Security: If API_KEY is set in env, require it in headers
+    // If NOT set (local dev), skip check.
+    if (API_KEY) {
+      const authHeader = req.headers["authorization"];
+      if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
+        return res.status(401).json({ error: "Unauthorized: Invalid or missing API Key" });
+      }
     }
 
     const { username } = req.params;
@@ -67,38 +55,5 @@ app.get("/api/scrape/:username", async (req, res) => {
     });
   }
 });
-
-// Helpers
-function extractBearer(headerValue) {
-  return (
-    headerValue
-      .replace(/bearer/gi, "")
-      .replace(/[\s:]+/g, " ")
-      .trim() || null
-  );
-}
-
-async function validateToken() {
-  const now = Date.now();
-  if (cachedToken && now - cachedTokenFetchedAt < TOKEN_CACHE_MS) {
-    return cachedToken;
-  }
-  const url = process.env.MBC_SHEET_DATABASE;
-  if (!url) return null;
-
-  try {
-    const response = await fetch(url);
-    if (!response.ok) return null;
-    const result = await response.json();
-    const token = result?.data?.["Bot Database"]?.[0]?.["access_token"];
-    if (token) {
-      cachedToken = token;
-      cachedTokenFetchedAt = now;
-    }
-    return token;
-  } catch (err) {
-    return null;
-  }
-}
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
