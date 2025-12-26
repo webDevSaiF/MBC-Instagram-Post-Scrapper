@@ -35,9 +35,10 @@ async function scrapeInstagram(username) {
     });
   }
 
-  // Improved User-Agent (Mac Desktop)
-  await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-  await page.setViewport({ width: 1440, height: 900 });
+  // --- MOBILE EMULATION (SSR STRATEGY) ---
+  // Instagram often server-side renders the initial feed for mobile devices, which is easier to scrape than the Desktop SPA.
+  await page.setUserAgent('Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1');
+  await page.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true });
 
   const networkLogs = [];
 
@@ -143,44 +144,35 @@ async function scrapeInstagram(username) {
     }
 
     // --- GENERIC DOM FALLBACK (AGGRESSIVE) ---
-    // Render/Datacenter IPs often get a static page with no API calls but visible links.
-    // We stop looking for specific classes (like article or _aagv) and look for ANY link to a post.
     console.log('Trying Aggressive DOM fallback...');
 
     await page.waitForSelector('a[href*="/p/"]', { timeout: 5000 }).catch(() => console.log('No post links found in DOM'));
 
     const domPosts = await page.evaluate(() => {
-      // Find ALL anchors that look like post links
       const anchors = Array.from(document.querySelectorAll('a[href*="/p/"]'));
       const data = [];
       const seenLinks = new Set();
 
       anchors.forEach(anchor => {
-        // Get the absolute link
         const link = anchor.href;
         if (!link || seenLinks.has(link)) return;
-
-        // Try to find an image inside or near it
         const img = anchor.querySelector('img') || anchor.parentElement.querySelector('img');
-
         if (img && img.src) {
-          // Extract Shortcode
           const shortcodeMatch = link.match(/\/p\/([^\/]+)\//);
           const shortcode = shortcodeMatch ? shortcodeMatch[1] : 'unknown';
-
           data.push({
             id: shortcode,
             shortcode: shortcode,
             link: link,
-            type: 'GraphImage', // Assumption for DOM scrape
+            type: 'GraphImage',
             displayUrl: img.src,
             caption: img.alt || '',
-            timestamp: Date.now() / 1000 // Approximate
+            timestamp: Date.now() / 1000
           });
           seenLinks.add(link);
         }
       });
-      return data.slice(0, 12); // Limit to 12
+      return data.slice(0, 12);
     });
 
     if (domPosts.length > 0) {
@@ -191,21 +183,28 @@ async function scrapeInstagram(username) {
     // --- DIAGNOSTICS (HTML DUMP) ---
     console.log('Scrape failed. Dumping diagnostics...');
     const title = await page.title();
-    const htmlSnippet = await page.content();
+
+    // GET BODY CONTENT (More useful than HEAD)
+    const bodyContent = await page.evaluate(() => document.body ? document.body.innerHTML : 'CHECK_HTML_SNIPPET');
+    const fullContent = await page.content();
+
+    // Prioritize showing the BODY if it exists
+    const preview = bodyContent.length > 100 ? bodyContent : fullContent;
 
     return {
       _debug_error: true,
       message: "NO_POSTS_FOUND",
       possible_causes: [
-        "Instagram Login Wall (Session ID invalid/expired)",
+        "Instagram Login Wall",
         "Profile is Private",
-        "Render IP Blocked"
+        "Render IP Blocked",
+        "Mobile Layout Changed"
       ],
       debug_info: {
         page_title: title,
         network_requests: networkLogs.length,
         cookies_set: !!process.env.INSTAGRAM_SESSION_ID,
-        html_preview: htmlSnippet.substring(0, 2000) // DUMP HTML TO SEE WHAT RENDER SEES
+        html_preview: preview.substring(0, 2000)
       }
     };
 
