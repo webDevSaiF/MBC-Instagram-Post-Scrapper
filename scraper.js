@@ -36,7 +36,6 @@ async function scrapeInstagram(username) {
   }
 
   // --- MOBILE EMULATION (SSR STRATEGY) ---
-  // Instagram often server-side renders the initial feed for mobile devices, which is easier to scrape than the Desktop SPA.
   await page.setUserAgent('Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1');
   await page.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true });
 
@@ -65,8 +64,6 @@ async function scrapeInstagram(username) {
     console.log(`Navigating to ${url}...`);
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await new Promise(r => setTimeout(r, 4000));
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
     // Allow initial load
     await new Promise(r => setTimeout(r, 4000));
@@ -79,7 +76,7 @@ async function scrapeInstagram(username) {
     }
     await new Promise(r => setTimeout(r, 2000)); // Final settle
 
-    // --- DATA EXTRACTION ---
+    // --- DATA EXTRACTION (API FALLBACK) ---
     let posts = [];
 
     // Helper to normalize different API response structures
@@ -175,41 +172,38 @@ async function scrapeInstagram(username) {
     // --- GENERIC DOM FALLBACK (AGGRESSIVE) ---
     console.log('Network logs empty... Trying Aggressive DOM fallback...');
 
-    const domPosts = await page.evaluate(() => {
-      const anchors = Array.from(document.querySelectorAll('a[href*="/p/"]'));
+    let domPosts = await page.evaluate(() => {
+      const anchors = Array.from(document.querySelectorAll('a')); // Get ALL links
       const data = [];
       const seenLinks = new Set();
 
       anchors.forEach(anchor => {
         const link = anchor.href;
-        if (!link || seenLinks.has(link)) return;
+        if (!link || (!link.includes('/p/') && !link.includes('/reel/'))) return;
+        if (seenLinks.has(link)) return;
 
         // Get Image
-        const img = anchor.querySelector('img') || anchor.parentElement.querySelector('img');
-        const parent = anchor.parentElement;
+        const img = anchor.querySelector('img');
 
         if (img && img.src) {
-          const shortcodeMatch = link.match(/\/p\/([^\/]+)\//);
+          const shortcodeMatch = link.match(/\/(?:p|reel)\/([^\/]+)\//);
           const shortcode = shortcodeMatch ? shortcodeMatch[1] : 'unknown';
 
-          // Basic Type Detection via Aria-label or Classes
-          // Mobile web often puts "Video" in accessibility labels
-          const ariaLabel = anchor.getAttribute('aria-label') || img.getAttribute('alt') || '';
-          const isVideo = ariaLabel.toLowerCase().includes('video') || !!parent.querySelector('video') || !!document.querySelector(`a[href*="${shortcode}"] span[aria-label="Video"]`);
-          const isSidecar = ariaLabel.toLowerCase().includes('carousel') || !!parent.querySelector('.coreSpriteSidecarIconLarge');
+          // Detect Video via URL or DOM clues
+          const isReel = link.includes('/reel/');
+          const hasVideoLabel = anchor.getAttribute('aria-label') === 'Reel' || !!anchor.querySelector('.coreSpritePlayIconSmall');
 
           data.push({
             id: shortcode,
             shortcode: shortcode,
             link: link,
-            type: isVideo ? 'GraphVideo' : (isSidecar ? 'GraphSidecar' : 'GraphImage'),
+            type: (isReel || hasVideoLabel) ? 'GraphVideo' : 'GraphImage',
             displayUrl: img.src,
             caption: img.alt || '',
             timestamp: Date.now() / 1000,
-            // Note: Real videoUrl/sidecar arrays are impossible to get from Feed DOM scraping alone
-            // We mark them so the user knows, but can't fetch the deep data without API interception.
-            isVideo: isVideo,
-            isSidecar: isSidecar
+            isVideo: isReel || hasVideoLabel,
+            isSidecar: false, // Default to false, fixed in hydration
+            requires_hydration: true // Flag to tell scraper to visit page
           });
           seenLinks.add(link);
         }
@@ -218,7 +212,54 @@ async function scrapeInstagram(username) {
     });
 
     if (domPosts.length > 0) {
-      console.log(`DOM Fallback found ${domPosts.length} posts.`);
+      console.log(`DOM Fallback found ${domPosts.length} posts. Starting Deep Hydration (fetching video URLs)...`);
+
+      // --- DEEP HYDRATION LOOP ---
+      // Visit each post to get the actual Video URL and Sidecar data
+      for (let i = 0; i < domPosts.length; i++) {
+        const post = domPosts[i];
+        try {
+          // console.log(`Hydrating post ${i+1}/${domPosts.length}: ${post.shortcode}`);
+          await page.goto(post.link, { waitUntil: 'domcontentloaded', timeout: 45000 });
+
+          // Extract Sidecar? or Video?
+          const metaData = await page.evaluate(() => {
+            const getMeta = (prop) => document.querySelector(`meta[property="${prop}"]`)?.content;
+            return {
+              videoUrl: getMeta('og:video'),
+              image: getMeta('og:image'),
+              type: getMeta('og:type'),
+              desc: getMeta('og:description'),
+              isSidecar: !!document.querySelector('.coreSpriteRightChevron') || !!document.querySelector('ul._aca0') // Indicators of carousel
+            };
+          });
+
+          // Merge Hydrated Data
+          if (metaData.videoUrl) {
+            post.isVideo = true;
+            post.type = 'GraphVideo';
+            post.videoUrl = metaData.videoUrl;
+          }
+
+          // Update image if higher quality available
+          if (metaData.image) post.displayUrl = metaData.image;
+
+          // Detect Sidecar (Basic meta detection)
+          if (metaData.isSidecar) {
+            post.isSidecar = true;
+            post.type = 'GraphSidecar';
+            // Note: Extracting all sidecar children via DOM is very hard without clicking.
+            // We at least mark it correctly.
+          }
+
+        } catch (err) {
+          console.log(`Failed to hydrate ${post.shortcode}: ${err.message}`);
+        }
+
+        // Random delay to be safe
+        await new Promise(r => setTimeout(r, 1000 + Math.random() * 2000));
+      }
+
       return domPosts;
     }
 
