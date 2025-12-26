@@ -66,8 +66,18 @@ async function scrapeInstagram(username) {
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await new Promise(r => setTimeout(r, 4000));
-    await page.evaluate(() => window.scrollBy(0, 500));
-    await new Promise(r => setTimeout(r, 2000));
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+    // Allow initial load
+    await new Promise(r => setTimeout(r, 4000));
+
+    // Scroll multiple times to trigger infinite scroll (Mobile View)
+    console.log('Scrolling to load more posts...');
+    for (let i = 0; i < 4; i++) {
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      await new Promise(r => setTimeout(r, 1500));
+    }
+    await new Promise(r => setTimeout(r, 2000)); // Final settle
 
     // --- DATA EXTRACTION ---
     let posts = [];
