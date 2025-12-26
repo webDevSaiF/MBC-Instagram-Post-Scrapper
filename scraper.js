@@ -6,11 +6,14 @@ const fs = require('fs');
 async function scrapeInstagram(username) {
   const browser = await puppeteer.launch({
     headless: "new",
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
-      '--disable-gpu'
+      '--disable-gpu',
+      '--disable-animations',
+      '--no-zygote'
     ]
   });
   const page = await browser.newPage();
