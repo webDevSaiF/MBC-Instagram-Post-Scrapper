@@ -16,7 +16,6 @@ async function scrapeInstagram(username) {
     ]
   };
 
-  // Render.com specific path
   if (process.env.PUPPETEER_EXECUTABLE_PATH) {
     launchOptions.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
   }
@@ -24,20 +23,30 @@ async function scrapeInstagram(username) {
   const browser = await puppeteer.launch(launchOptions);
   const page = await browser.newPage();
 
-  // Improved User-Agent (Mac Desktop) to encourage standard web view
+  // --- 1. SET SESSION COOKIE IF PROVIDED ---
+  if (process.env.INSTAGRAM_SESSION_ID) {
+    // console.log("Applying Session ID...");
+    await page.setCookie({
+      name: "sessionid",
+      value: process.env.INSTAGRAM_SESSION_ID,
+      domain: ".instagram.com",
+      path: "/",
+      httpOnly: true,
+      secure: true
+    });
+  }
+
+  // Improved User-Agent (Mac Desktop)
   await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
   await page.setViewport({ width: 1440, height: 900 });
 
   const networkLogs = [];
 
-  // Enable request interception to capture API responses
   page.on('response', async (response) => {
     const request = response.request();
-    // We care about XHR/Fetch for data
     if (request.resourceType() === 'xhr' || request.resourceType() === 'fetch') {
       try {
         const url = response.url();
-        // Filter for GraphQL or internal API endpoints
         if (url.includes('graphql') || url.includes('/api/v1/')) {
           const contentType = response.headers()['content-type'];
           if (contentType && contentType.includes('application/json')) {
@@ -47,9 +56,7 @@ async function scrapeInstagram(username) {
             }
           }
         }
-      } catch (err) {
-        // ignore errors reading response body (e.g. redirects)
-      }
+      } catch (err) { }
     }
   });
 
@@ -57,23 +64,13 @@ async function scrapeInstagram(username) {
     const url = `https://www.instagram.com/${username}/`;
     console.log(`Navigating to ${url}...`);
 
-    // Slightly looser timeout control
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-
-    // Wait a bit for ANY network activity to settle
     await new Promise(r => setTimeout(r, 4000));
-
-    // Scroll to trigger lazy loading
     await page.evaluate(() => window.scrollBy(0, 500));
     await new Promise(r => setTimeout(r, 2000));
 
-    // Check if login is required or page not found
-    const privateAccount = await page.$('h2');
-
-    // --- DATA EXTRACTION FROM NETWORK LOGS ---
+    // --- DATA EXTRACTION ---
     let posts = [];
-
-    // Helper to find key in deep object
     function findEdges(obj) {
       if (!obj || typeof obj !== 'object') return [];
       if (obj.edges && Array.isArray(obj.edges) && obj.edges.length > 0 && obj.edges[0].node) {
@@ -88,7 +85,6 @@ async function scrapeInstagram(username) {
       return [];
     }
 
-    // Look for "edge_owner_to_timeline_media" in any captured JSON
     for (const log of networkLogs) {
       const jsonString = JSON.stringify(log.data);
       if (jsonString.includes('edge_owner_to_timeline_media')) {
@@ -97,7 +93,6 @@ async function scrapeInstagram(username) {
           edges.forEach(edge => {
             const node = edge.node;
             if (node) {
-              // Extract basic info
               const post = {
                 id: node.id,
                 shortcode: node.shortcode,
@@ -109,19 +104,15 @@ async function scrapeInstagram(username) {
                 timestamp: node.taken_at_timestamp,
                 ownerId: node.owner ? node.owner.id : null
               };
-
-              // Media Extraction Logic
               if (node.is_video && node.video_url) {
                 post.isVideo = true;
                 post.videoUrl = node.video_url;
                 post.videoViewCount = node.video_view_count;
-                post.displayUrl = node.display_url; // Thumbnail
+                post.displayUrl = node.display_url;
               } else {
                 post.isVideo = false;
                 post.displayUrl = node.display_url;
               }
-
-              // Sidecar (Carousel) Handling
               if (node.edge_sidecar_to_children && node.edge_sidecar_to_children.edges) {
                 post.isSidecar = true;
                 post.children = node.edge_sidecar_to_children.edges.map(childEdge => {
@@ -135,10 +126,8 @@ async function scrapeInstagram(username) {
                     accessibilityCaption: child.accessibility_caption
                   };
                 });
-                // Collect all image URLs for convenience
                 post.images = post.children.map(c => c.displayUrl);
               }
-
               posts.push(post);
             }
           });
@@ -146,7 +135,6 @@ async function scrapeInstagram(username) {
       }
     }
 
-    // Deduplicate posts
     posts = posts.filter((v, i, a) => a.findIndex(v2 => (v2.shortcode === v.shortcode)) === i);
 
     if (posts.length > 0) {
@@ -154,53 +142,26 @@ async function scrapeInstagram(username) {
       return posts;
     }
 
-    // --- DIAGNOSTICS FOR RENDER ---
+    // --- DIAGNOSTICS ---
     console.log('Network extraction failed/empty. Checking why...');
-
     const title = await page.title();
-    const content = await page.content();
-    const isLogin = content.includes('Login') || title.includes('Login') || url.includes('accounts/login');
 
-    // Check if explicitly redirected
-    if (page.url().includes('login')) {
-      return {
-        _debug_error: true,
-        message: "REDIRECTED_TO_LOGIN",
-        details: "Instagram redirected the scraper to the login page."
-      };
-    }
-
-    if (isLogin) {
-      return {
-        _debug_error: true,
-        message: "LOGIN_WALL_DETECTED",
-        details: "Page title or content indicates a login wall.",
-        pageTitle: title
-      };
-    }
-
-    // --- DOM FALLBACK ---
-    console.log('Trying DOM fallback...');
-    const domPosts = await page.evaluate(() => {
-      const postElements = document.querySelectorAll('article a');
-      const data = [];
-      postElements.forEach(post => {
-        const link = post.href;
-        const img = post.querySelector('img');
-        if (link && img) {
-          data.push({
-            link,
-            imageUrl: img.src,
-            caption: img.alt
-          });
-        }
-      });
-      return data;
-    });
-
-    if (domPosts.length > 0) return domPosts;
-
-    return [];
+    // Detailed Debug Info specifically for User/Render debugging
+    // This will only be returned if posts.length == 0
+    return {
+      _debug_error: true,
+      message: "NO_POSTS_FOUND",
+      possible_causes: [
+        "Instagram Login Wall (Session ID invalid/expired)",
+        "Profile is Private",
+        "Render IP Blocked"
+      ],
+      debug_info: {
+        page_title: title,
+        network_requests: networkLogs.length,
+        cookies_set: !!process.env.INSTAGRAM_SESSION_ID
+      }
+    };
 
   } catch (error) {
     console.error(`Error scraping ${username}: ${error.message}`);
