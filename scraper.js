@@ -142,28 +142,51 @@ async function scrapeInstagram(username) {
       return posts;
     }
 
-    // --- DOM FALLBACK WITH EXPANDED SELECTORS ---
-    console.log('Trying DOM fallback...');
-    const domPosts = await page.evaluate(() => {
-      // Updated selectors to catch more variations of the grid
-      const postElements = document.querySelectorAll('article a, div._aagv');
-      const data = [];
-      postElements.forEach(post => {
-        const link = post.href || post.closest('a')?.href;
-        const img = post.querySelector('img') || post.closest('img');
+    // --- GENERIC DOM FALLBACK (AGGRESSIVE) ---
+    // Render/Datacenter IPs often get a static page with no API calls but visible links.
+    // We stop looking for specific classes (like article or _aagv) and look for ANY link to a post.
+    console.log('Trying Aggressive DOM fallback...');
 
-        if (link && img && link.includes('/p/')) {
+    await page.waitForSelector('a[href*="/p/"]', { timeout: 5000 }).catch(() => console.log('No post links found in DOM'));
+
+    const domPosts = await page.evaluate(() => {
+      // Find ALL anchors that look like post links
+      const anchors = Array.from(document.querySelectorAll('a[href*="/p/"]'));
+      const data = [];
+      const seenLinks = new Set();
+
+      anchors.forEach(anchor => {
+        // Get the absolute link
+        const link = anchor.href;
+        if (!link || seenLinks.has(link)) return;
+
+        // Try to find an image inside or near it
+        const img = anchor.querySelector('img') || anchor.parentElement.querySelector('img');
+
+        if (img && img.src) {
+          // Extract Shortcode
+          const shortcodeMatch = link.match(/\/p\/([^\/]+)\//);
+          const shortcode = shortcodeMatch ? shortcodeMatch[1] : 'unknown';
+
           data.push({
-            link,
-            imageUrl: img.src,
-            caption: img.alt || ''
+            id: shortcode,
+            shortcode: shortcode,
+            link: link,
+            type: 'GraphImage', // Assumption for DOM scrape
+            displayUrl: img.src,
+            caption: img.alt || '',
+            timestamp: Date.now() / 1000 // Approximate
           });
+          seenLinks.add(link);
         }
       });
-      return data;
+      return data.slice(0, 12); // Limit to 12
     });
 
-    if (domPosts.length > 0) return domPosts;
+    if (domPosts.length > 0) {
+      console.log(`DOM Fallback found ${domPosts.length} posts.`);
+      return domPosts;
+    }
 
     // --- DIAGNOSTICS (HTML DUMP) ---
     console.log('Scrape failed. Dumping diagnostics...');
