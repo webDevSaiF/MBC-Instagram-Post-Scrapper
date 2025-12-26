@@ -4,9 +4,8 @@ puppeteer.use(StealthPlugin());
 const fs = require('fs');
 
 async function scrapeInstagram(username) {
-  const browser = await puppeteer.launch({
+  const launchOptions = {
     headless: "new",
-    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -15,12 +14,19 @@ async function scrapeInstagram(username) {
       '--disable-animations',
       '--no-zygote'
     ]
-  });
+  };
+
+  // Render.com specific path
+  if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+    launchOptions.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+  }
+
+  const browser = await puppeteer.launch(launchOptions);
   const page = await browser.newPage();
 
-  // Set a realistic User-Agent to avoid immediate blocking
-  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-  await page.setViewport({ width: 1280, height: 800 });
+  // Improved User-Agent (Mac Desktop) to encourage standard web view
+  await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+  await page.setViewport({ width: 1440, height: 900 });
 
   const networkLogs = [];
 
@@ -51,14 +57,15 @@ async function scrapeInstagram(username) {
     const url = `https://www.instagram.com/${username}/`;
     console.log(`Navigating to ${url}...`);
 
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+    // Slightly looser timeout control
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-    // Wait a bit for any lazy requests and scroll down a bit to trigger more loading
+    // Wait a bit for ANY network activity to settle
+    await new Promise(r => setTimeout(r, 4000));
+
+    // Scroll to trigger lazy loading
     await page.evaluate(() => window.scrollBy(0, 500));
-    await new Promise(r => setTimeout(r, 5000));
-
-    // Create debug file if needed locally, but comment out for prod to save space
-    // fs.writeFileSync('debug_network.json', JSON.stringify(networkLogs, null, 2));
+    await new Promise(r => setTimeout(r, 2000));
 
     // Check if login is required or page not found
     const privateAccount = await page.$('h2');
@@ -147,32 +154,53 @@ async function scrapeInstagram(username) {
       return posts;
     }
 
+    // --- DIAGNOSTICS FOR RENDER ---
+    console.log('Network extraction failed/empty. Checking why...');
+
+    const title = await page.title();
+    const content = await page.content();
+    const isLogin = content.includes('Login') || title.includes('Login') || url.includes('accounts/login');
+
+    // Check if explicitly redirected
+    if (page.url().includes('login')) {
+      return {
+        _debug_error: true,
+        message: "REDIRECTED_TO_LOGIN",
+        details: "Instagram redirected the scraper to the login page."
+      };
+    }
+
+    if (isLogin) {
+      return {
+        _debug_error: true,
+        message: "LOGIN_WALL_DETECTED",
+        details: "Page title or content indicates a login wall.",
+        pageTitle: title
+      };
+    }
+
     // --- DOM FALLBACK ---
-    console.log('Network extraction failed/empty. Trying DOM fallback...');
-    await page.waitForSelector('article img', { timeout: 5000 }).catch(() => console.log('No posts found or timeout wait for images'));
-
+    console.log('Trying DOM fallback...');
     const domPosts = await page.evaluate(() => {
-      const postElements = document.querySelectorAll('article a'); // Links to posts
+      const postElements = document.querySelectorAll('article a');
       const data = [];
-
       postElements.forEach(post => {
         const link = post.href;
         const img = post.querySelector('img');
-        const src = img ? img.src : null;
-        const alt = img ? img.alt : null;
-
-        if (link && src) {
+        if (link && img) {
           data.push({
             link,
-            imageUrl: src,
-            caption: alt
+            imageUrl: img.src,
+            caption: img.alt
           });
         }
       });
       return data;
     });
 
-    return domPosts;
+    if (domPosts.length > 0) return domPosts;
+
+    return [];
 
   } catch (error) {
     console.error(`Error scraping ${username}: ${error.message}`);
