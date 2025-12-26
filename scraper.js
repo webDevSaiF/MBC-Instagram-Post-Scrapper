@@ -81,82 +81,99 @@ async function scrapeInstagram(username) {
 
     // --- DATA EXTRACTION ---
     let posts = [];
-    function findEdges(obj) {
-      if (!obj || typeof obj !== 'object') return [];
-      if (obj.edges && Array.isArray(obj.edges) && obj.edges.length > 0 && obj.edges[0].node) {
-        return obj.edges;
+
+    // Helper to normalize different API response structures
+    function parsePost(node) {
+      const post = {
+        id: node.id || node.pk,
+        shortcode: node.code || node.shortcode,
+        link: `https://www.instagram.com/p/${node.code || node.shortcode}/`,
+        type: 'GraphImage', // default
+        caption: '',
+        commentsCount: 0,
+        likesCount: 0,
+        timestamp: node.taken_at || node.taken_at_timestamp,
+        ownerId: node.user ? (node.user.pk || node.user.id) : (node.owner ? node.owner.id : null)
+      };
+
+      // Extract Caption
+      if (node.caption && node.caption.text) {
+        post.caption = node.caption.text;
+      } else if (node.edge_media_to_caption && node.edge_media_to_caption.edges.length > 0) {
+        post.caption = node.edge_media_to_caption.edges[0].node.text;
       }
-      for (const key in obj) {
-        if (obj.hasOwnProperty(key)) {
-          const res = findEdges(obj[key]);
-          if (res.length > 0) return res;
-        }
+
+      // Extract Counts
+      if (node.comment_count !== undefined) post.commentsCount = node.comment_count;
+      else if (node.edge_media_to_comment) post.commentsCount = node.edge_media_to_comment.count;
+
+      if (node.like_count !== undefined) post.likesCount = node.like_count;
+      else if (node.edge_media_preview_like) post.likesCount = node.edge_media_preview_like.count;
+
+      // Determine Type & Media
+      const mediaType = node.media_type; // 1=Img, 2=Vid, 8=Sidecar
+      const isVideo = node.is_video || mediaType === 2;
+      const isSidecar = !!node.carousel_media || !!node.edge_sidecar_to_children || mediaType === 8;
+
+      if (isVideo) {
+        post.type = 'GraphVideo';
+        post.isVideo = true;
+        post.videoUrl = node.video_versions ? node.video_versions[0].url : node.video_url;
+        post.videoViewCount = node.video_view_count || node.view_count;
+        post.displayUrl = node.image_versions2 ? node.image_versions2.candidates[0].url : node.display_url;
+      } else if (isSidecar) {
+        post.type = 'GraphSidecar';
+        post.isSidecar = true;
+        post.displayUrl = node.image_versions2 ? node.image_versions2.candidates[0].url : node.display_url;
+
+        // Extract Children
+        const childrenNodes = node.carousel_media || (node.edge_sidecar_to_children ? node.edge_sidecar_to_children.edges.map(e => e.node) : []);
+        post.children = childrenNodes.map(child => {
+          return {
+            id: child.id || child.pk,
+            type: (child.media_type === 2 || child.is_video) ? 'GraphVideo' : 'GraphImage',
+            displayUrl: child.image_versions2 ? child.image_versions2.candidates[0].url : child.display_url,
+            videoUrl: (child.video_versions ? child.video_versions[0].url : child.video_url) || null
+          };
+        });
+        post.images = post.children.map(c => c.displayUrl); // Flatten for convenience
+      } else {
+        post.type = 'GraphImage';
+        post.isVideo = false;
+        post.displayUrl = node.image_versions2 ? node.image_versions2.candidates[0].url : node.display_url;
       }
-      return [];
+
+      return post;
     }
 
     // Search Network Logs
     for (const log of networkLogs) {
-      const jsonString = JSON.stringify(log.data);
-      if (jsonString.includes('edge_owner_to_timeline_media')) {
-        const edges = findEdges(log.data);
-        if (edges.length > 0) {
-          edges.forEach(edge => {
-            const node = edge.node;
-            if (node) {
-              const post = {
-                id: node.id,
-                shortcode: node.shortcode,
-                link: `https://www.instagram.com/p/${node.shortcode}/`,
-                type: node.__typename,
-                caption: node.edge_media_to_caption && node.edge_media_to_caption.edges.length > 0 ? node.edge_media_to_caption.edges[0].node.text : '',
-                commentsCount: node.edge_media_to_comment ? node.edge_media_to_comment.count : 0,
-                likesCount: node.edge_media_preview_like ? node.edge_media_preview_like.count : 0,
-                timestamp: node.taken_at_timestamp,
-                ownerId: node.owner ? node.owner.id : null
-              };
-              if (node.is_video && node.video_url) {
-                post.isVideo = true;
-                post.videoUrl = node.video_url;
-                post.videoViewCount = node.video_view_count;
-                post.displayUrl = node.display_url;
-              } else {
-                post.isVideo = false;
-                post.displayUrl = node.display_url;
-              }
-              if (node.edge_sidecar_to_children && node.edge_sidecar_to_children.edges) {
-                post.isSidecar = true;
-                post.children = node.edge_sidecar_to_children.edges.map(childEdge => {
-                  const child = childEdge.node;
-                  return {
-                    id: child.id,
-                    type: child.__typename,
-                    isVideo: child.is_video,
-                    displayUrl: child.display_url,
-                    videoUrl: child.is_video ? child.video_url : null,
-                    accessibilityCaption: child.accessibility_caption
-                  };
-                });
-                post.images = post.children.map(c => c.displayUrl);
-              }
-              posts.push(post);
-            }
-          });
-        }
+      const data = log.data;
+
+      // 1. New Mobile API: { items: [...] } or { status: 'ok', items: [...] }
+      let items = null;
+      if (data.items && Array.isArray(data.items)) items = data.items;
+      else if (data.data && data.data.user && data.data.user.edge_owner_to_timeline_media) items = data.data.user.edge_owner_to_timeline_media.edges.map(e => e.node);
+
+      if (items && items.length > 0) {
+        items.forEach(item => {
+          try {
+            const p = parsePost(item);
+            if (p.shortcode) posts.push(p);
+          } catch (e) { }
+        });
       }
     }
 
     posts = posts.filter((v, i, a) => a.findIndex(v2 => (v2.shortcode === v.shortcode)) === i);
 
     if (posts.length > 0) {
-      console.log(`Extracted ${posts.length} posts from network logs.`);
+      console.log(`Extracted ${posts.length} posts from network logs (Mobile/Graph API).`);
       return posts;
     }
 
     // --- GENERIC DOM FALLBACK (AGGRESSIVE) ---
-    console.log('Trying Aggressive DOM fallback...');
-
-    await page.waitForSelector('a[href*="/p/"]', { timeout: 5000 }).catch(() => console.log('No post links found in DOM'));
+    console.log('Network logs empty... Trying Aggressive DOM fallback...');
 
     const domPosts = await page.evaluate(() => {
       const anchors = Array.from(document.querySelectorAll('a[href*="/p/"]'));
@@ -166,18 +183,33 @@ async function scrapeInstagram(username) {
       anchors.forEach(anchor => {
         const link = anchor.href;
         if (!link || seenLinks.has(link)) return;
+
+        // Get Image
         const img = anchor.querySelector('img') || anchor.parentElement.querySelector('img');
+        const parent = anchor.parentElement;
+
         if (img && img.src) {
           const shortcodeMatch = link.match(/\/p\/([^\/]+)\//);
           const shortcode = shortcodeMatch ? shortcodeMatch[1] : 'unknown';
+
+          // Basic Type Detection via Aria-label or Classes
+          // Mobile web often puts "Video" in accessibility labels
+          const ariaLabel = anchor.getAttribute('aria-label') || img.getAttribute('alt') || '';
+          const isVideo = ariaLabel.toLowerCase().includes('video') || !!parent.querySelector('video') || !!document.querySelector(`a[href*="${shortcode}"] span[aria-label="Video"]`);
+          const isSidecar = ariaLabel.toLowerCase().includes('carousel') || !!parent.querySelector('.coreSpriteSidecarIconLarge');
+
           data.push({
             id: shortcode,
             shortcode: shortcode,
             link: link,
-            type: 'GraphImage',
+            type: isVideo ? 'GraphVideo' : (isSidecar ? 'GraphSidecar' : 'GraphImage'),
             displayUrl: img.src,
             caption: img.alt || '',
-            timestamp: Date.now() / 1000
+            timestamp: Date.now() / 1000,
+            // Note: Real videoUrl/sidecar arrays are impossible to get from Feed DOM scraping alone
+            // We mark them so the user knows, but can't fetch the deep data without API interception.
+            isVideo: isVideo,
+            isSidecar: isSidecar
           });
           seenLinks.add(link);
         }
