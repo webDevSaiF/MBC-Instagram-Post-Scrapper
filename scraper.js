@@ -12,7 +12,10 @@ async function scrapeInstagram(username) {
       '--disable-dev-shm-usage',
       '--disable-gpu',
       '--disable-animations',
-      '--no-zygote'
+      '--no-zygote',
+      '--disable-extensions',
+      '--disable-software-rasterizer',
+      '--mute-audio'
     ]
   };
 
@@ -22,6 +25,18 @@ async function scrapeInstagram(username) {
 
   const browser = await puppeteer.launch(launchOptions);
   const page = await browser.newPage();
+
+  // --- RESOURCE OPTIMIZATION (Prevent OOM) ---
+  // Critical for Render Free Tier (512MB). We only need HTML + Scripts (for React), not assets.
+  await page.setRequestInterception(true);
+  page.on('request', (req) => {
+    const resourceType = req.resourceType();
+    if (['image', 'media', 'font', 'stylesheet'].includes(resourceType)) {
+      req.abort();
+    } else {
+      req.continue();
+    }
+  });
 
   // --- 1. SET SESSION COOKIE IF PROVIDED ---
   if (process.env.INSTAGRAM_SESSION_ID) {
